@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
@@ -28,7 +29,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
  * I wrote this simply to see how a real AWS Lambda function's running time can affect TPS with a fixed concurrencyAtomic.
  * The Lambda function is the simplest one you can think of, like the following Python function. The Lambda function
  * is triggered through API Gateway. Of course you can easily change the URL endpoint to anyone you like, to say, load test a
- * HTTP based website.
+ * HTTP base website.
  *
  * import json
  * import time
@@ -51,7 +52,41 @@ import static java.util.concurrent.TimeUnit.SECONDS;
  */
 class LoadGenerator {
 
+    static class RateLimiter {
+        private volatile AtomicLong bucketSizeAtomic = new AtomicLong(0);
+        private volatile AtomicLong lastRefilledTimeInMillisAtomic = new AtomicLong(System.currentTimeMillis());
+
+        private final int REFILL_SIZE_PER_SECOND;
+        private final int MAX_BUCKET_SIZE;
+
+        public RateLimiter(int maxBucketSize, int refillSizePerSecond) {
+            MAX_BUCKET_SIZE = maxBucketSize;
+            REFILL_SIZE_PER_SECOND = refillSizePerSecond;
+        }
+
+        public boolean tryConsume() {
+            // refill
+            long currentInMillis = System.currentTimeMillis();
+            long elapsedInMillis = currentInMillis - lastRefilledTimeInMillisAtomic.get();
+            // Do the refill only if it has been 100ms since last refill
+            if (elapsedInMillis > 100) {
+                long tokensToAdd = elapsedInMillis * REFILL_SIZE_PER_SECOND / 1000;
+                long targetTokens = Math.min(tokensToAdd + bucketSizeAtomic.get(), MAX_BUCKET_SIZE);
+                bucketSizeAtomic.set(targetTokens);
+                lastRefilledTimeInMillisAtomic.set(currentInMillis);
+            }
+
+            if (bucketSizeAtomic.get() > 0) {
+                bucketSizeAtomic.decrementAndGet();
+                return true;
+            } else {
+                return false;
+            }
+        }
+    }
+
     // For sending HTTP requests to the API gateway
+    // Number of threads must be greater than the concurrency you want to sustain
     static ExecutorService executorService = Executors.newFixedThreadPool(200);
 
     // For periodically reporting metrics
@@ -59,7 +94,7 @@ class LoadGenerator {
 
     static URL url;
 
-    static volatile AtomicInteger requestsSentInLastReportingPeriodAtomic = new AtomicInteger(0);
+    static  AtomicInteger requestsSentInLastReportingPeriodAtomic = new AtomicInteger(0);
     static volatile AtomicInteger requestsSucceededInLastReportingPeriodAtomic = new AtomicInteger(0);
     static volatile AtomicInteger concurrencyAtomic = new AtomicInteger(0);
     static volatile AtomicInteger everSentAtomic = new AtomicInteger(0);
@@ -69,14 +104,37 @@ class LoadGenerator {
 
     static final long REPORTING_PERIOD_IN_SECONDS = 1;
     static final int MAX_ALLOWED_CONCURRENCY = 10;
-    static final Semaphore SEMAPHORE = new Semaphore(MAX_ALLOWED_CONCURRENCY);
+    static final int MAX_ALLOWED_TPS = 70;
+    static final Semaphore CONCURRENCY_SEMAPHORE = new Semaphore(MAX_ALLOWED_CONCURRENCY);
     static final boolean PRINT_RESPONSE = false;
 
-    static private void makeRequest() {
+    static RateLimiter rateLimiter;
+
+    /**
+     *
+     * @param isConcurrencyThrottling whether you want it be concurrecny throttled or TPS throttled
+     */
+    static private void makeRequest(boolean isConcurrencyThrottling) {
         long startTime = System.currentTimeMillis();
         BufferedReader in;
         long responseByteLength = 0;
         StringBuilder allContent = new StringBuilder();
+
+        if (isConcurrencyThrottling) {
+            try {
+                CONCURRENCY_SEMAPHORE.acquire();
+            } catch (InterruptedException ie) {
+                String currentThreadName = Thread.currentThread().getName();
+                System.out.println(String.format("Thread %s is interrupted", currentThreadName));
+                return;
+            }
+        } else {
+            boolean allowed = rateLimiter.tryConsume();
+            if (!allowed) {
+                return;
+            }
+        }
+
         try {
             concurrencyAtomic.incrementAndGet();
             everSentAtomic.incrementAndGet();
@@ -97,7 +155,10 @@ class LoadGenerator {
         } catch (Exception e) {
             System.out.println("A request failed: " + e.getMessage());
         } finally {
-            SEMAPHORE.release();
+            if (isConcurrencyThrottling) {
+                CONCURRENCY_SEMAPHORE.release();
+            }
+
             concurrencyAtomic.decrementAndGet();
             long duration = System.currentTimeMillis() - startTime;
             latencies.add(duration);
@@ -113,9 +174,11 @@ class LoadGenerator {
         installShutdownHook();
         scheduleMetricsReporter();
 
+        rateLimiter = new RateLimiter(MAX_ALLOWED_TPS, MAX_ALLOWED_TPS);
+
         try {
             // This is an AWS API Gateway endpoint that acts as a trigger to a simple Lambda function
-            url = new URL("https://abcde.execute-api.us-west-2.amazonaws.com/default/jianwcui_test");
+            url = new URL("https://abc.execute-api.us-west-2.amazonaws.com/default/jianwcui_test");
         } catch (MalformedURLException e) {
             System.out.println("URL is malformed");
             return;
@@ -123,17 +186,11 @@ class LoadGenerator {
 
         while(true) {
             try {
-                // This guarantees that we never go beyond concurrency limit
-                SEMAPHORE.acquire();
-            } catch (InterruptedException ie) {
-                String currentThreadName = Thread.currentThread().getName();
-                System.out.println(String.format("Thread %s is interrupted", currentThreadName));
-                return;
-            }
-            try {
-                executorService.execute(() -> makeRequest());
-            } catch (RejectedExecutionException rejectedExecutionException) {
-                System.out.println("A task is rejected by executor service");
+                executorService.execute(() -> makeRequest(false));
+                // I know, hacky
+                Thread.yield();
+            } catch (RejectedExecutionException e) {
+                System.out.println("A task is rejected by executor service: " + e.getMessage() );
             }
         }
     }
